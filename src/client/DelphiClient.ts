@@ -96,7 +96,7 @@ const NETWORK_DEFAULTS: Record<Network, Partial<DelphiClientConfig>> = {
     delphiAppUrl: "https://testnet.delphi.fyi"
   },
   mainnet: {
-    rpcUrl: "https://gensyn-mainnet.g.alchemy.com/public",
+    rpcUrl: "https://rpc-gensyn-mainnet.t.conduit.xyz",
     chainId: 685689,
     gatewayAddress: "0x982a67aE92D8de361957249fB2BB4a62BCc6A8d5" as `0x${string}`,
     factoryAddress: "0x9C73417f79a1361c6aF9Bd828343badEE1b84936" as `0x${string}`,

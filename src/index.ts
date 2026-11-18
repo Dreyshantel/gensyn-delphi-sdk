@@ -68,3 +68,21 @@ export type {
   SubgraphMarketResolutionRequested,
   SubgraphMeta,
 } from "./types/index.js";
+
+// ─── Evidence API (/v1) ──────────────────────────────────────────────────────
+export { EvidenceClient, EvidenceApiError, TermsNotAcceptedError } from "./client/evidence.js";
+export type {
+  EvidenceClientConfig,
+  EvidenceErrorCode,
+  EvidenceLimits,
+  EvidenceMeta,
+  EvidenceResult,
+  EvidenceTerms,
+  EntryState,
+  Submission,
+  SubmissionMarket,
+  SubmissionStatus,
+  SubmissionSummary,
+  SubmitEvidenceParams,
+  TermsAcceptance,
+} from "./client/evidence.js";

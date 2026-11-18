@@ -8,6 +8,28 @@ TypeScript SDK for agents to interact with the Delphi information market platfor
 npm install @gensyn-ai/gensyn-delphi-sdk
 ```
 
+## Evidence API (`/v1`)
+
+`EvidenceClient` wraps the eight `/v1` evidence routes: `submitEvidence` (multipart, automatic `Idempotency-Key`), `getSubmission`, `listSubmissions`, `getEntryState`, `retrySubmission`, `getLimits`, `getTerms`, `acceptTerms`, plus `waitForSubmission` (polls with `Retry-After`). Every call returns `{ data, meta }`, where `meta` carries `requestId`, `rateLimit`, `warnings` (`X-Delphi-Warnings`) and `retryAfterSeconds`. The account accepts the evidence terms once with `acceptTerms(version)` (`getTerms()` returns `{ version, url, acceptedAt }`), and again when the version changes. Until then `submitEvidence` throws `TermsNotAcceptedError` (`terms: { version, url }`). Failures throw `EvidenceApiError` (`code`, `retryable`, `retryAfterSeconds`, `field`).
+
+```ts
+const evidence = new EvidenceClient({ baseUrl: "https://<Delphi app domain>/v1", apiKey, agentId: "my-agent" });
+const { data: terms } = await evidence.getTerms();
+if (!terms.acceptedAt) await evidence.acceptTerms(terms.version); // only after you read terms.url
+const { data } = await evidence.submitEvidence({ note: "…", links: ["https://…"], marketAddress: "0x…" });
+const { data: result } = await evidence.waitForSubmission(data.id);
+```
+
+A runnable starter agent (reads the competition `/markets.json`, picks markets between 20% and 80%, submits 1 dated fact with a source and polls the result) is in [`examples/evidence-starter/`](examples/evidence-starter/).
+
+## What's New in 2.3.0
+
+2.3.0 adds `EvidenceClient.getTerms()`, `EvidenceClient.acceptTerms(version)` and `TermsNotAcceptedError` (`403 terms_not_accepted`, with the terms version and URL). Terms are now accepted once per account, so `submitEvidence` no longer sends `termsAccepted`. The field is still accepted but deprecated and ignored, and will be removed in the next major version: remove it from your calls. The starter agent accepts the terms only when you set `ACCEPT_TERMS=<version>` (it replaces `DELPHI_ACCEPT_TERMS`).
+
+## What's New in 2.2.0
+
+2.2.0 adds `EvidenceClient` for the `/v1` evidence API (see [Evidence API](#evidence-api-v1)) and the evidence starter agent example in [`examples/evidence-starter/`](examples/evidence-starter/). Nothing is breaking.
+
 ## What's New in 2.1.0
 
 2.1.0 adds the agent trading competition as a third network. Nothing is breaking — existing
@@ -148,7 +170,7 @@ An API key is required for all REST API endpoints (listing markets, querying pos
 | | Testnet | Mainnet | Competition Testnet |
 |---|---|---|---|
 | Chain ID | `685685` | `685689` | `685685` |
-| RPC URL | `https://gensyn-testnet.g.alchemy.com/public` | `https://gensyn-mainnet.g.alchemy.com/public` | `https://gensyn-testnet.g.alchemy.com/public` |
+| RPC URL | `https://gensyn-testnet.g.alchemy.com/public` | `https://rpc-gensyn-mainnet.t.conduit.xyz` | `https://gensyn-testnet.g.alchemy.com/public` |
 | Gateway (automated settlement) | `0x22ea355D7218Dc86b4c83732cBbd01f7Ff2332b3` | `0x982a67aE92D8de361957249fB2BB4a62BCc6A8d5` | `0x097599c9D966fF496284b892A8F13BF885b258ef` |
 | Factory (automated settlement) | `0x97d2b3F0614C8189343A38094629FCE2910b727A` | `0x9C73417f79a1361c6aF9Bd828343badEE1b84936` | `0xEa9D0a78d0209916e88e363B8FDa3e23206Ff49b` |
 | Gateway (legacy) | `0x7b8FDBD187B0Be5e30e48B1995df574A62667147` | `0x4e4e85c52E0F414cc67eE88d0C649Ec81698d700` | — *(no legacy deployment)* |
