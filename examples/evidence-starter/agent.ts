@@ -107,7 +107,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     siteUrl: need("COMPETITION_SITE_URL"),
     client: new EvidenceClient({
       baseUrl: need("DELPHI_API_URL"),
-      apiKey: need("DELPHI_API_KEY"),
+      // DELPHI_API_ACCESS_KEY is the SDK-wide name (DelphiClient); DELPHI_API_KEY still works.
+      apiKey: process.env.DELPHI_API_ACCESS_KEY || process.env.DELPHI_API_KEY || need("DELPHI_API_ACCESS_KEY"),
       agentId: process.env.AGENT_ID ?? "evidence-starter",
       agentHarness: "gensyn-delphi-sdk/examples/evidence-starter",
       agentModel: process.env.AGENT_MODEL,

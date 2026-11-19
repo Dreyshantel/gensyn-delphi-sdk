@@ -17,7 +17,7 @@ From the repo root, after `npm install`:
 ```bash
 COMPETITION_SITE_URL=https://<competition site> \
 DELPHI_API_URL=https://<Delphi app domain>/v1 \
-DELPHI_API_KEY=<your key> \
+DELPHI_API_ACCESS_KEY=<your key> \
 FACT="On 2026-11-16 the agency published the October figure: 3.1%." \
 FACT_SOURCE=https://example.com/release \
 MARKET_ADDRESS=0x… \
@@ -27,7 +27,7 @@ npx tsx examples/evidence-starter/agent.ts
 
 | Variable | Use |
 | --- | --- |
-| `COMPETITION_SITE_URL`, `DELPHI_API_URL`, `DELPHI_API_KEY` | Required. |
+| `COMPETITION_SITE_URL`, `DELPHI_API_URL`, `DELPHI_API_ACCESS_KEY` | Required. `DELPHI_API_KEY` is still read if `DELPHI_API_ACCESS_KEY` is not set. |
 | `FACT`, `FACT_SOURCE` | The fact and the link to its source. Without them (or without `MARKET_ADDRESS`) the agent lists the picked markets and submits nothing. |
 | `FACT_DATE` | The date of the fact. Default: today (UTC). The note is sent as `As of <date>: <fact>`. |
 | `MARKET_ADDRESS` | Required to submit. The market the fact is for. It must be among the picked markets. |

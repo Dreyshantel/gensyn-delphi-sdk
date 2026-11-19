@@ -3,7 +3,7 @@ import { EvidenceClient, EvidenceApiError, TermsNotAcceptedError } from "../../s
 
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
-const sub = (status: string) => ({ id: "s1", createdAt: "t", status, markets: [] });
+const sub = (status: string) => ({ id: "s1", createdAt: "t", agentId: null, note: null, links: [], files: [], status, markets: [] });
 
 function make(responses: Response[]) {
   const fetch = vi.fn(async () => responses.shift()!);
@@ -83,7 +83,22 @@ describe("EvidenceClient", () => {
     expect(e1).toBeInstanceOf(EvidenceApiError);
     expect(e1).toMatchObject({ status: 429, code: "rate_limited", retryable: true, retryAfterSeconds: 1200, requestId: "r9" });
     const e2 = await client.retrySubmission("s1").catch((e) => e);
-    expect(e2).toMatchObject({ code: "invalid_request", field: "note" });
+    expect(e2).toMatchObject({ code: "invalid_request", field: "note", limit: null });
+  });
+
+  it("exposes the limit of rate_limited and the new codes", async () => {
+    const { client } = make([
+      json(429, { error: { code: "rate_limited", message: "hour", retryable: true, retryAfterSeconds: 60, field: null, limit: "hourly" } }),
+      json(429, { error: { code: "cap_reached", message: "full", retryable: false, retryAfterSeconds: null, field: null } }),
+      json(404, { error: { code: "market_not_found", message: "none", retryable: false, retryAfterSeconds: null, field: "marketAddress" } }),
+    ]);
+    expect(await client.submitEvidence({ note: "n" }).catch((e) => e)).toMatchObject({ code: "rate_limited", limit: "hourly" });
+    expect(await client.submitEvidence({ note: "n" }).catch((e) => e)).toMatchObject({ code: "cap_reached", retryable: false, retryAfterSeconds: null });
+    expect(await client.submitEvidence({ note: "n", marketAddress: "0xtypo" }).catch((e) => e)).toMatchObject({
+      status: 404,
+      code: "market_not_found",
+      field: "marketAddress",
+    });
   });
 
   it("reads and accepts the terms", async () => {
@@ -122,10 +137,10 @@ describe("EvidenceClient", () => {
       json(200, { canSubmit: true, remainingOnMarket: 3, rateLimit: { resetAt: "x" } }),
       json(202, sub("queued")),
     ]);
-    await client.listSubmissions({ market: "0xm", limit: 5 });
+    await client.listSubmissions({ market: "0xm", agentId: "agent-1", limit: 5 });
     await client.getEntryState("0xm");
     await client.retrySubmission("s1");
-    expect(call(fetch, 0).url).toBe("https://app.test/v1/submissions?market=0xm&limit=5");
+    expect(call(fetch, 0).url).toBe("https://app.test/v1/submissions?market=0xm&agentId=agent-1&limit=5");
     expect(call(fetch, 1).url).toBe("https://app.test/v1/markets/0xm/entry-state");
     expect(call(fetch, 2)).toMatchObject({ url: "https://app.test/v1/submissions/s1/retry" });
     expect(call(fetch, 2).init.method).toBe("POST");

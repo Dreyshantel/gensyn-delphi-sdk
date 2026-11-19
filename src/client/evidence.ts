@@ -9,14 +9,22 @@ export interface SubmissionMarket {
   status: string;
   verdict: string | null;
   reason: string | null;
+  /** An accepted submission with a reward of 0 has state `none`; `zeroPayReason` says why. */
   bounty: { amount: string; state: "held" | "paid" | "voided" | "none" } | null;
   settlementUpTo: string | null;
-  zeroPayReason?: string;
+  /** Why an accepted submission paid 0. `below_minimum` still counts for the settlement score. */
+  zeroPayReason?: "daily_cap" | "pot_empty" | "below_minimum";
 }
 
 export interface Submission {
   id: string;
   createdAt: string;
+  /** `X-Agent-Id` of the submitting call. */
+  agentId: string | null;
+  /** The account's own content of the submission. */
+  note: string | null;
+  links: string[];
+  files: { name: string | null; contentType: string; sizeBytes: number }[];
   status: SubmissionStatus;
   code?: string;
   canRetry?: boolean;
@@ -25,13 +33,15 @@ export interface Submission {
   markets: SubmissionMarket[];
 }
 
-/** List entries; the contract does not spell out the summary fields, so extra keys are allowed. */
-export type SubmissionSummary = Pick<Submission, "id" | "createdAt" | "status"> & Record<string, unknown>;
+/** List entries are full submissions; extra keys stay readable as in 2.3.0. */
+export type SubmissionSummary = Submission & Record<string, unknown>;
 
 export interface EntryState {
   canSubmit: boolean;
   reason?: string;
   remainingOnMarket: number;
+  /** USDC.e base units left in the market's judgement pot. Information only: an empty pot pays 0 but does not block. */
+  judgementPotRemainingBaseUnits: string;
   restricted?: boolean;
   rateLimit: { resetAt: string };
 }
@@ -91,9 +101,14 @@ export type EvidenceErrorCode =
   | "terms_not_accepted"
   | "forbidden"
   | "not_found"
+  | "market_not_found"
   | "idempotency_conflict"
   | "rate_limited"
+  | "cap_reached"
   | "server_error";
+
+/** Which limit a `rate_limited` error hit. */
+export type RateLimitName = "call_rate" | "hourly" | "bytes_24h" | "failed_keys" | "retry_backoff";
 
 export class EvidenceApiError extends Error {
   constructor(
@@ -105,6 +120,8 @@ export class EvidenceApiError extends Error {
     readonly field: string | null,
     readonly requestId?: string,
     readonly meta: EvidenceMeta = {},
+    /** `rate_limited` only: the limit hit. */
+    readonly limit: RateLimitName | string | null = null,
   ) {
     super(message);
     this.name = "EvidenceApiError";
@@ -178,7 +195,7 @@ export class EvidenceClient {
   }
 
   listSubmissions(
-    q: { market?: string; cursor?: string; limit?: number } = {},
+    q: { market?: string; agentId?: string; cursor?: string; limit?: number } = {},
   ): Promise<EvidenceResult<{ items: SubmissionSummary[]; nextCursor: string | null }>> {
     return this.request("GET", "/submissions", { query: q });
   }
@@ -258,7 +275,7 @@ export class EvidenceClient {
     };
     const text = await res.text();
     type Terms = { version: string; url: string };
-    let json: { error?: { code?: string; message?: string; retryable?: boolean; retryAfterSeconds?: number; field?: string; terms?: Terms }; terms?: Terms; requestId?: string } | undefined;
+    let json: { error?: { code?: string; message?: string; retryable?: boolean; retryAfterSeconds?: number; field?: string; terms?: Terms; limit?: string }; terms?: Terms; requestId?: string } | undefined;
     try { json = text ? JSON.parse(text) : undefined; } catch { /* non-JSON body */ }
     if (!res.ok) {
       const e = json?.error;
@@ -271,6 +288,7 @@ export class EvidenceClient {
         e?.field ?? null,
         json?.requestId ?? meta.requestId,
         meta,
+        e?.limit ?? null,
       ] as const;
       // The contract puts `terms` on the error; read it from the body root too.
       const terms = e?.terms ?? json?.terms;
