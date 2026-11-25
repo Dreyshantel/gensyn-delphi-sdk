@@ -28,6 +28,25 @@ import type {
   EvidenceEvaluation,
 } from "./evidence-research.js";
 
+import { createInterface } from "node:readline/promises";
+
+import { createLlmClientFromEnv, type LlmClient } from "./llm-client.js";
+import { mineCandidates, type MiningResult } from "./evidence-miner.js";
+import { SubmissionHistory, DEFAULT_HISTORY_PATH } from "./submission-history.js";
+import {
+  refreshVerdicts,
+  runSubmissions,
+  type SubmissionMode,
+  type SubmissionRunSummary,
+} from "./submission-runner.js";
+import { createGoogleNewsRssProvider } from "./google-news-provider.js";
+import { createTavilySearchProvider } from "./tavily-search-provider.js";
+import type { ResearchSearchProvider } from "./source-discovery.js";
+import {
+  createLlmQueryGenerator,
+  focusedQueryGenerator,
+} from "./focused-query-generator.js";
+
 /** Reuses the validated market structure from market-discovery.ts. */
 export type MarketCard = DiscoveredMarket;
 
@@ -250,7 +269,7 @@ function logEvidenceEvaluation(
 
   if (evaluation.relevanceAssessment) {
     log(
-      `Assessment direction: ${evaluation.relevanceAssessment.direction}`,
+      `Assessment direction: ${evaluation.relevanceAssessment.direction ?? "not established"}`,
     );
 
     if (evaluation.relevanceAssessment.relationship) {
@@ -396,7 +415,7 @@ export async function runResearchMode(opts: {
       const assessment = item.assessment;
 
       log(`\nAssessment: ${item.article.title}`);
-      log(`Direction: ${assessment.direction}`);
+      log(`Direction: ${assessment.direction ?? "not established"}`);
 
       log(
         `Relevance: ${formatScore(assessment.relevanceScore)}`,
@@ -543,6 +562,300 @@ export async function runResearchMode(opts: {
 }
 
 /**
+ * Resolution criteria for every open market.
+ *
+ * Supplied criteria (RESOLUTION_CRITERIA_JSON) win. Otherwise the market
+ * question itself is the criterion: competition markets are Yes/No
+ * questions, so the question states what resolves them. Markets on which
+ * this agent has used all its submissions get no criteria, which makes
+ * the pipeline skip them instead of spending research on them.
+ */
+export function buildCriteriaMap(
+  markets: MarketCard[],
+  supplied: Record<string, string>,
+  isMarketFull: (address: string) => boolean = () => false,
+): Map<string, string> {
+  const suppliedByAddress = new Map(
+    Object.entries(supplied).map(([address, criteria]) => [
+      address.toLowerCase(),
+      criteria.trim(),
+    ]),
+  );
+
+  const criteria = new Map<string, string>();
+
+  for (const market of markets) {
+    const key = market.address.toLowerCase();
+
+    if (isMarketFull(market.address)) {
+      continue;
+    }
+
+    const sources =
+      market.dataSources.length > 0
+        ? ` Relevant data sources: ${market.dataSources.join(", ")}.`
+        : "";
+
+    criteria.set(
+      key,
+      suppliedByAddress.get(key) ||
+        `The market resolves YES if the following happens, and NO otherwise: ${market.question}${sources}`,
+    );
+  }
+
+  return criteria;
+}
+
+/**
+ * Google News (free, no key) plus Tavily when TAVILY_API_KEY is set.
+ * One provider failing does not stop the other.
+ */
+export function buildSearchProvider(
+  env: NodeJS.ProcessEnv = process.env,
+): ResearchSearchProvider {
+  const providers: ResearchSearchProvider[] = [
+    createGoogleNewsRssProvider({
+      edition: {
+        hl: env.GOOGLE_NEWS_HL?.trim() || "en-US",
+        gl: env.GOOGLE_NEWS_GL?.trim() || "US",
+      },
+    }),
+  ];
+
+  if (env.TAVILY_API_KEY?.trim()) {
+    const tavily = createTavilySearchProvider({
+      maxResults: 8,
+      searchDepth: "basic",
+      topic: "news",
+    });
+
+    // `when:7d` is Google News syntax; Tavily would search for it as text.
+    providers.push((query) =>
+      tavily({
+        ...query,
+        query: query.query.replace(/\s*\bwhen:\d+[hdmy]\b/gi, "").trim(),
+      }),
+    );
+  }
+
+  if (providers.length === 1) {
+    return providers[0];
+  }
+
+  return async (query) => {
+    const settled = await Promise.allSettled(
+      providers.map((provider) => provider(query)),
+    );
+
+    const results = settled.flatMap((outcome) =>
+      outcome.status === "fulfilled" && Array.isArray(outcome.value)
+        ? outcome.value
+        : [],
+    );
+
+    if (results.length === 0 && settled.every((o) => o.status === "rejected")) {
+      throw (settled[0] as PromiseRejectedResult).reason;
+    }
+
+    return results;
+  };
+}
+
+export interface MineModeOptions {
+  siteUrl: string;
+  mode: SubmissionMode;
+  /** Without an LLM the agent researches but cannot set a YES/NO direction. */
+  llm: LlmClient | null;
+  client?: EvidenceClient;
+  history: SubmissionHistory;
+  resolutionCriteriaByMarket?: Record<string, string>;
+  acceptTermsVersion?: string;
+  confirm?: (preview: string) => Promise<boolean>;
+  /** Markets researched per run (1..10). Default 5. */
+  maxMarkets?: number;
+  /** Articles sent to the LLM per market. Default 3. */
+  maxArticlesPerMarket?: number;
+  /** Default 5. */
+  maxSubmissionsPerRun?: number;
+  minConfidence?: number;
+  /** Ask the LLM for search queries (one call per market). Default true when an LLM is set. */
+  useLlmQueryPlanner?: boolean;
+  researchOptions?: ResearchRunnerOptions;
+  fetch?: typeof fetch;
+  log?: (...args: unknown[]) => void;
+  now?: number;
+}
+
+/**
+ * Full competition loop: discover → research → extract → check → submit.
+ *
+ * Safe by default: in "dry-run" nothing is sent.
+ */
+export async function runMineMode(opts: MineModeOptions): Promise<{
+  mining: MiningResult | null;
+  summary: SubmissionRunSummary | null;
+}> {
+  const log = opts.log ?? console.log;
+  const now = opts.now ?? Date.now();
+  const maxPerMarket = 3;
+
+  const markets = await discoverMarkets({
+    siteUrl: opts.siteUrl,
+    fetch: opts.fetch,
+    skipInvalidMarkets: true,
+    onInvalidMarket: (message) => log(message),
+  });
+  const open = getOpenMarkets(markets, now);
+
+  const criteriaByMarket = buildCriteriaMap(
+    open,
+    opts.resolutionCriteriaByMarket ?? {},
+    (address) => opts.history.forMarket(address).length >= maxPerMarket,
+  );
+
+  log(`Markets discovered: ${markets.length}, open: ${open.length}, with slots left: ${criteriaByMarket.size}`);
+
+  if (criteriaByMarket.size === 0) {
+    log("Nothing to research.");
+    return { mining: null, summary: null };
+  }
+
+  const queryGenerator =
+    opts.llm && opts.useLlmQueryPlanner !== false
+      ? createLlmQueryGenerator(opts.llm, focusedQueryGenerator, log)
+      : focusedQueryGenerator;
+
+  const research = await runMarketResearchPipeline({
+    siteUrl: opts.siteUrl,
+    fetch: opts.fetch,
+    skipInvalidMarkets: true,
+    now,
+    resolutionCriteriaByMarket: Object.fromEntries(criteriaByMarket),
+    maxMarketsToResearch: Math.min(10, Math.max(1, opts.maxMarkets ?? 5)),
+    researchOptions: {
+      maxArticlesToFetch: 8,
+      queryGenerator,
+      ...opts.researchOptions,
+      assessmentModel:
+        opts.researchOptions?.assessmentModel ?? ruleBasedEvidenceAssessor,
+    },
+  });
+
+  log(`Markets researched: ${research.researchedCount}`);
+
+  for (const entry of research.researches) {
+    log(
+      `- ${entry.market.question}\n` +
+        `  queries ${entry.research.plan.queries.length}, sources ${entry.research.discovery.sources.length}, ` +
+        `fetched ${entry.research.articles.length}, assessed ${entry.research.assessments.length}`,
+    );
+  }
+
+  for (const failure of research.researchFailures) {
+    log(`Research failed for ${failure.marketAddress}: ${failure.reason}`);
+  }
+
+  if (!opts.llm) {
+    log(
+      "\nNo LLM configured (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL), so no YES/NO " +
+        "direction can be established and nothing is submitted. Run RESEARCH_MODE=1 " +
+        "for the detailed research report.",
+    );
+    return { mining: null, summary: null };
+  }
+
+  const mining = await mineCandidates({
+    research,
+    llm: opts.llm,
+    criteriaByMarket,
+    maxArticlesPerMarket: opts.maxArticlesPerMarket,
+    skipArticle: (marketAddress, url) =>
+      opts.history.forMarket(marketAddress).some((record) => record.sourceUrl === url),
+    extraction: { now },
+    log,
+  });
+
+  log(
+    `\nArticles sent to the LLM: ${mining.articlesSentToLlm} ` +
+      `(LLM calls this run: ${opts.llm.callsMade}), candidates: ${mining.candidates.length}`,
+  );
+
+  for (const failure of mining.failures) {
+    log(`  no candidate from ${failure.url}: ${failure.reason}`);
+  }
+
+  const summary = await runSubmissions({
+    candidates: mining.candidates,
+    history: opts.history,
+    mode: opts.mode,
+    client: opts.client,
+    acceptTermsVersion: opts.acceptTermsVersion,
+    confirm: opts.confirm,
+    maxSubmissionsPerRun: opts.maxSubmissionsPerRun,
+    minConfidence: opts.minConfidence,
+    log,
+    // A fixed time for tests; live runs re-read the clock per check.
+    now: opts.now === undefined ? Date.now : () => now,
+  });
+
+  log("\n========== RUN SUMMARY ==========");
+  log(`Mode: ${opts.mode}`);
+  log(`Candidates: ${summary.candidates}, eligible: ${summary.eligible}, skipped: ${summary.skipped}`);
+
+  if (opts.mode === "dry-run") {
+    log(`Would submit: ${summary.previewed}. Nothing was sent (SUBMIT_MODE=dry-run).`);
+  } else {
+    log(
+      `Submitted: ${summary.submitted} (judged ${summary.judged}, rejected ${summary.rejected}, ` +
+        `failed ${summary.failed}), declined: ${summary.declined}, resent: ${summary.resumed}`,
+    );
+  }
+
+  if (summary.stoppedReason) {
+    log(`Stopped early: ${summary.stoppedReason}`);
+  }
+
+  return { mining, summary };
+}
+
+/** Refreshes verdicts and prints the agent's submission record. */
+export async function runStatusMode(opts: {
+  client: EvidenceClient;
+  history: SubmissionHistory;
+  log?: (...args: unknown[]) => void;
+}): Promise<void> {
+  const log = opts.log ?? console.log;
+
+  await refreshVerdicts(opts.client, opts.history, log);
+
+  const records = opts.history.all();
+  const markets = new Set(records.map((r) => r.marketAddress.toLowerCase()));
+  const judged = records.filter((r) => r.status === "judged");
+
+  log("\n========== SUBMISSION HISTORY ==========");
+
+  for (const record of records) {
+    log(
+      `${record.createdAt.slice(0, 16)}  ${record.status.padEnd(9)} ${record.direction.toUpperCase().padEnd(3)} ` +
+        `${record.bounty ? `${record.bounty.amount} (${record.bounty.state})` : "-"}  ${record.marketQuestion.slice(0, 60)}`,
+    );
+
+    if (record.reason) {
+      log(`    reason: ${record.reason}`);
+    }
+
+    if (record.lastError && record.status === "pending") {
+      log(`    unconfirmed: ${record.lastError}`);
+    }
+  }
+
+  log(
+    `\nJudged: ${judged.length} across ${new Set(judged.map((r) => r.marketAddress.toLowerCase())).size} market(s) ` +
+      `(prize eligibility needs 10 judged across 3+ markets). Total records: ${records.length} on ${markets.size} market(s).`,
+  );
+}
+
+/**
  * Parses and validates resolution criteria supplied through
  * the environment.
  */
@@ -614,8 +927,114 @@ if (
   };
 
   const siteUrl = need("COMPETITION_SITE_URL");
+  const agentMode = process.env.AGENT_MODE?.trim().toLowerCase();
 
-  if (process.env.RESEARCH_MODE === "1") {
+  const createClient = (): EvidenceClient =>
+    new EvidenceClient({
+      baseUrl: need("DELPHI_API_URL"),
+      apiKey:
+        process.env.DELPHI_API_ACCESS_KEY?.trim() ||
+        process.env.DELPHI_API_KEY?.trim() ||
+        need("DELPHI_API_ACCESS_KEY"),
+      agentId: process.env.AGENT_ID?.trim() || "evidence-starter",
+      agentHarness:
+        process.env.AGENT_HARNESS?.trim() ||
+        "gensyn-delphi-sdk/examples/evidence-starter",
+      agentModel:
+        process.env.AGENT_MODEL?.trim() ||
+        process.env.LLM_MODEL?.trim().slice(0, 64) ||
+        undefined,
+    });
+
+  const optionalInt = (key: string): number | undefined => {
+    const raw = process.env[key]?.trim();
+
+    if (!raw) {
+      return undefined;
+    }
+
+    const value = Number(raw);
+
+    if (!Number.isInteger(value) || value < 0) {
+      console.error(`${key} must be a non-negative integer`);
+      process.exit(1);
+    }
+
+    return value;
+  };
+
+  if (agentMode === "mine" || agentMode === "status") {
+    const main = async (): Promise<void> => {
+      const history = SubmissionHistory.load(
+        process.env.HISTORY_PATH?.trim() || DEFAULT_HISTORY_PATH,
+      );
+
+      if (agentMode === "status") {
+        await runStatusMode({ client: createClient(), history });
+        return;
+      }
+
+      const rawMode = process.env.SUBMIT_MODE?.trim().toLowerCase() || "dry-run";
+
+      if (rawMode !== "dry-run" && rawMode !== "approve" && rawMode !== "auto") {
+        throw new Error("SUBMIT_MODE must be dry-run, approve or auto");
+      }
+
+      const mode: SubmissionMode = rawMode;
+      const hasApiKey = Boolean(
+        process.env.DELPHI_API_ACCESS_KEY?.trim() || process.env.DELPHI_API_KEY?.trim(),
+      );
+
+      // Dry runs use the API read-only when a key is present, so the
+      // preview reflects real limits and past submissions.
+      const client =
+        mode !== "dry-run" || (hasApiKey && process.env.DELPHI_API_URL?.trim())
+          ? createClient()
+          : undefined;
+
+      const rawCriteria = process.env.RESOLUTION_CRITERIA_JSON?.trim();
+      const minConfidenceRaw = process.env.MIN_CONFIDENCE?.trim();
+      const minConfidence = minConfidenceRaw ? Number(minConfidenceRaw) : undefined;
+
+      if (minConfidence !== undefined && !(minConfidence >= 0 && minConfidence <= 1)) {
+        throw new Error("MIN_CONFIDENCE must be between 0 and 1");
+      }
+
+      let readline: ReturnType<typeof createInterface> | undefined;
+
+      const confirm = async (): Promise<boolean> => {
+        readline ??= createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await readline.question("Submit this? [y/N] ");
+        return answer.trim().toLowerCase() === "y";
+      };
+
+      try {
+        await runMineMode({
+          siteUrl,
+          mode,
+          llm: createLlmClientFromEnv(),
+          client,
+          history,
+          resolutionCriteriaByMarket: rawCriteria ? parseResolutionCriteria(rawCriteria) : {},
+          acceptTermsVersion: process.env.ACCEPT_TERMS?.trim() || undefined,
+          confirm,
+          maxMarkets: optionalInt("MAX_MARKETS"),
+          maxArticlesPerMarket: optionalInt("MAX_ARTICLES_PER_MARKET"),
+          maxSubmissionsPerRun: optionalInt("MAX_SUBMISSIONS"),
+          minConfidence,
+          useLlmQueryPlanner: process.env.LLM_QUERY_PLANNER?.trim() !== "0",
+          researchOptions: { searchProvider: buildSearchProvider() },
+        });
+      } finally {
+        readline?.close();
+      }
+    };
+
+    main().catch((error) => {
+      console.error(`${agentMode} mode failed:`, error);
+      process.exit(1);
+    });
+  } else if (process.env.RESEARCH_MODE === "1") {
     // Research mode does not require Delphi API credentials.
     let resolutionCriteriaByMarket: Record<string, string>;
 

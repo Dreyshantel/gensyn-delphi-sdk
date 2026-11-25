@@ -220,6 +220,7 @@ export function createTavilySearchProvider(
       if (controller.signal.aborted) {
         throw new Error(
           `Tavily search timed out after ${timeoutMs}ms`,
+          { cause: error },
         );
       }
 

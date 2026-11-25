@@ -103,3 +103,32 @@ describe("market discovery", () => {
     ).toBe(0);
   });
 });
+
+describe("lenient market parsing", () => {
+  it("skips malformed entries and reports them when asked to", async () => {
+    const { parseMarkets } = await import("../../examples/evidence-starter/market-discovery.js");
+    const messages: string[] = [];
+    const good = {
+      address: "0xgood",
+      question: "Will it happen?",
+      status: "open",
+      odds: { yes: 50, no: 50 },
+      evidenceCutoffAt: "2026-12-01T00:00:00Z",
+      dataSources: [],
+    };
+
+    const markets = parseMarkets([{ address: "0xbad" }, good], {
+      skipInvalidMarkets: true,
+      onInvalidMarket: (m) => messages.push(m),
+    });
+
+    expect(markets.map((m) => m.address)).toEqual(["0xgood"]);
+    expect(messages).toEqual(["Skipped market: Market 0xbad has an invalid question"]);
+  });
+
+  it("still rejects the whole list by default", async () => {
+    const { parseMarkets } = await import("../../examples/evidence-starter/market-discovery.js");
+
+    expect(() => parseMarkets([{ address: "0xbad" }])).toThrow();
+  });
+});

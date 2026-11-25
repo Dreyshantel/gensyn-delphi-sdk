@@ -20,6 +20,13 @@ export interface DiscoveredMarket {
 export interface MarketDiscoveryOptions {
   siteUrl: string;
   fetch?: typeof fetch;
+  /**
+   * Skip malformed market entries instead of rejecting the whole list.
+   * A live feed with one bad entry must not stop the agent.
+   */
+  skipInvalidMarkets?: boolean;
+  /** Receives one message per skipped market. */
+  onInvalidMarket?: (message: string) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -97,7 +104,10 @@ function parseMarket(value: unknown, index: number): DiscoveredMarket {
  *   [...]
  *   { markets: [...] }
  */
-export function parseMarkets(body: unknown): DiscoveredMarket[] {
+export function parseMarkets(
+  body: unknown,
+  options: Pick<MarketDiscoveryOptions, "skipInvalidMarkets" | "onInvalidMarket"> = {},
+): DiscoveredMarket[] {
   const rawMarkets = Array.isArray(body)
     ? body
     : isRecord(body) && Array.isArray(body.markets)
@@ -108,7 +118,23 @@ export function parseMarkets(body: unknown): DiscoveredMarket[] {
     throw new Error("Invalid markets response: expected an array or { markets: [] }");
   }
 
-  return rawMarkets.map((market, index) => parseMarket(market, index));
+  if (!options.skipInvalidMarkets) {
+    return rawMarkets.map((market, index) => parseMarket(market, index));
+  }
+
+  const markets: DiscoveredMarket[] = [];
+
+  rawMarkets.forEach((market, index) => {
+    try {
+      markets.push(parseMarket(market, index));
+    } catch (error) {
+      options.onInvalidMarket?.(
+        `Skipped market: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
+
+  return markets;
 }
 
 /**
@@ -128,7 +154,7 @@ export async function discoverMarkets(
 
   const body: unknown = await response.json();
 
-  return parseMarkets(body);
+  return parseMarkets(body, options);
 }
 
 /**

@@ -6,6 +6,11 @@ export interface GoogleNewsRssOptions {
   fetch?: typeof fetch;
   maxResults?: number;
   timeoutMs?: number;
+  /**
+   * Google News edition. Default: Nigeria/English (`en-NG`, `NG`).
+   * Use `{ hl: "en-US", gl: "US" }` for US and global markets.
+   */
+  edition?: { hl: string; gl: string };
 }
 
 interface GoogleNewsArticle {
@@ -441,6 +446,7 @@ export function createGoogleNewsRssProvider(
   const fetcher = options.fetch ?? fetch;
   const maxResults = options.maxResults ?? 10;
   const timeoutMs = options.timeoutMs ?? 12_000;
+  const edition = options.edition ?? { hl: "en-NG", gl: "NG" };
 
   if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) {
     throw new Error("maxResults must be an integer between 1 and 50");
@@ -454,9 +460,12 @@ export function createGoogleNewsRssProvider(
     const url = new URL("https://news.google.com/rss/search");
 
     url.searchParams.set("q", query.query);
-    url.searchParams.set("hl", "en-NG");
-    url.searchParams.set("gl", "NG");
-    url.searchParams.set("ceid", "NG:en");
+    url.searchParams.set("hl", edition.hl);
+    url.searchParams.set("gl", edition.gl);
+    url.searchParams.set(
+      "ceid",
+      `${edition.gl}:${edition.hl.split("-")[0]}`,
+    );
 
     const response = await fetcher(url, {
       headers: {

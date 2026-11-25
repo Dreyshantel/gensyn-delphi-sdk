@@ -595,10 +595,15 @@ export async function fetchArticle(
   const fetcher: typeof fetch =
     options.fetch ??
     ((input, init) => {
-      return undiciFetch(input, {
-        ...init,
-        dispatcher: secureAgent!,
-      }) as unknown as Promise<Response>;
+      // undici's fetch types differ slightly from the DOM fetch types
+      // (for example, Request.duplex); the runtime values are compatible.
+      return undiciFetch(
+        input as Parameters<typeof undiciFetch>[0],
+        {
+          ...(init as Parameters<typeof undiciFetch>[1]),
+          dispatcher: secureAgent!,
+        },
+      ) as unknown as Promise<Response>;
     });
 
   let response: Response | undefined;
