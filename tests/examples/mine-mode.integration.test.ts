@@ -9,7 +9,7 @@ import type { ResearchRunnerOptions } from "../../examples/evidence-starter/rese
 const now = Date.parse("2026-11-25T12:00:00.000Z");
 const marketAddress = "0x1234567890abcdef1234567890abcdef12345678";
 const question = "Will Nigeria's annual inflation rate fall below 20 percent by December 2026?";
-const articleUrl = "https://example-news.test/nigeria-inflation";
+const articleUrl = "https://www.reuters.com/world/africa/nigeria-inflation";
 
 const articleContent = `
   Nigeria's National Bureau of Statistics published its consumer price index report on 15 November 2026.
@@ -81,6 +81,7 @@ const groundedReply = {
   asOfDate: "2026-11-15",
   direction: "yes",
   quote: "annual inflation fell to 18.2 percent in October 2026",
+  dateQuote: "on 15 November 2026",
   rationale: "The official figure is already below the 20 percent threshold.",
   confidence: 0.9,
 };
@@ -187,7 +188,9 @@ describe("mine mode (dry-run)", () => {
       log: (...args) => lines.push(args.join(" ")),
     });
 
-    expect(result).toEqual({ mining: null, summary: null });
+    expect(result).toMatchObject({ mining: null, summary: null });
+    expect(result.record.metrics.marketsResearched).toBe(1);
+    expect(result.record.warnings.join(" ")).toContain("No LLM configured");
     expect(lines.join("\n")).toContain("No LLM configured");
   });
 
@@ -244,7 +247,7 @@ describe("mineCandidates", () => {
           research: {
             assessments: [0.9, 0.8].map((score, i) => ({
               source: {
-                title: "t",
+                title: `Distinct report ${i === 0 ? "alpha one" : "beta two"}`,
                 url: `${articleUrl}/${i}`,
                 sourceName: "Example News",
                 originatingQuery: "q",
@@ -253,8 +256,8 @@ describe("mineCandidates", () => {
               article: {
                 requestedUrl: `${articleUrl}/${i}`,
                 finalUrl: `${articleUrl}/${i}`,
-                title: "t",
-                content: articleContent,
+                title: `Distinct report ${i === 0 ? "alpha one" : "beta two"}`,
+                content: `${i === 0 ? "Opening paragraph A." : "Different opening B."}\n${articleContent}`,
                 contentType: "text/html",
                 fetchedAt: "",
                 publishedAt: "2026-11-16T09:00:00.000Z",

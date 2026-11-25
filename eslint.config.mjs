@@ -23,6 +23,7 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ["dist/", "node_modules/", "tests/"],
+    // dashboard/ is a separate React app, type-checked by its own build.
+    ignores: ["dist/", "node_modules/", "tests/", "dashboard/"],
   },
 );

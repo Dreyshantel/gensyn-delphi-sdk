@@ -13,7 +13,8 @@
  *   - only real, quoted, dated evidence (no unsupported YES/NO).
  */
 
-import type { EvidenceDirection } from "./evidence-assessor.js";
+import type { EvidenceDirection, EvidenceRelationship } from "./evidence-assessor.js";
+import type { CredibilityTier } from "./source-credibility.js";
 import type { SubmissionRecord } from "./submission-history.js";
 
 export interface SubmissionCandidate {
@@ -32,6 +33,16 @@ export interface SubmissionCandidate {
   rationale: string;
   /** 0..1. */
   confidence: number;
+  /** How the LLM classified the evidence; only direct_support/contradiction are submittable. */
+  relationship?: EvidenceRelationship;
+  limitations?: string[];
+  credibility?: CredibilityTier;
+  /** Transparent composite score (see evidence-miner.ts); used for ordering, not as a gate. */
+  valueScore?: number;
+  /** Extra links that confirm the fact (sent after the source link). */
+  supportingLinks?: string[];
+  /** The stronger source that confirmed a fact from an unrated outlet. */
+  corroboratedBy?: { publisher: string; credibility: CredibilityTier };
 }
 
 export interface EligibilityContext {
@@ -57,6 +68,11 @@ export interface EligibilityContext {
   maxPerMarket?: number;
   /** Fact similarity (0..1) at which a candidate counts as a repeat. Default 0.6. */
   duplicateThreshold?: number;
+  /**
+   * Oldest as-of date accepted, in days. Default 30. An old fact is almost
+   * certainly known to the forecaster already, so it would earn nothing.
+   */
+  maxFactAgeDays?: number;
 }
 
 export interface EligibilityResult {
@@ -135,12 +151,35 @@ export function checkEligibility(
     reasons.push("No YES/NO direction has been established");
   }
 
+  if (
+    candidate.relationship !== undefined &&
+    candidate.relationship !== "direct_support" &&
+    candidate.relationship !== "contradiction"
+  ) {
+    reasons.push(`Classified as ${candidate.relationship}, not directional evidence`);
+  }
+
+  if (candidate.credibility === "low") {
+    reasons.push("Only a low-credibility source supports this; find the original report");
+  }
+
   if (!candidate.quote.trim()) {
     reasons.push("No verbatim source quote");
   }
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(candidate.asOfDate)) {
     reasons.push("The fact has no as-of date");
+  } else {
+    const maxAge = context.maxFactAgeDays ?? 30;
+    const ageDays = Math.floor(
+      (context.now - Date.parse(`${candidate.asOfDate}T00:00:00Z`)) / 86_400_000,
+    );
+
+    if (ageDays > maxAge) {
+      reasons.push(
+        `The fact is ${ageDays} days old (limit ${maxAge}); the forecaster has likely seen it`,
+      );
+    }
   }
 
   if (!(candidate.confidence >= minConfidence)) {
@@ -185,7 +224,9 @@ export function checkEligibility(
 
   if (
     context.history.some(
-      (record) => record.sourceUrl === candidate.sourceUrl,
+      (record) =>
+        record.sourceUrl === candidate.sourceUrl &&
+        !(record.status === "failed" && !record.submissionId),
     )
   ) {
     reasons.push("This source was already submitted to this market");

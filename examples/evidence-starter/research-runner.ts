@@ -47,6 +47,12 @@ export interface ResearchRunnerOptions {
   maxArticlesToFetch?: number;
   now?: number;
   assessmentModel?: EvidenceAssessmentModel;
+  /**
+   * Rank recently published sources above old ones before the fetch
+   * limit is applied. Judges pay for facts the forecaster does not know
+   * yet, and keyword overlap alone lets years-old pages win.
+   */
+  preferRecentSources?: boolean;
 }
 
 export interface ArticleFetchFailure {
@@ -286,9 +292,30 @@ function getQueryIntentBonus(
  * This is a shortlist heuristic, not a semantic relevance model,
  * source verification system, or credibility determination.
  */
+const DAY_MS = 86_400_000;
+
+/** Ranking bonus by source age: fresh news up, stale pages down, undated neutral. */
+export function recencyBonus(publishedAt: string | undefined, now: number): number {
+  const published = publishedAt ? Date.parse(publishedAt) : Number.NaN;
+
+  if (!Number.isFinite(published)) {
+    return 0;
+  }
+
+  const ageDays = (now - published) / DAY_MS;
+
+  if (ageDays <= 3) return 0.3;
+  if (ageDays <= 7) return 0.2;
+  if (ageDays <= 30) return 0;
+  if (ageDays <= 180) return -0.2;
+
+  return -0.4;
+}
+
 function rankSourcesForMarket(
   sources: DiscoveredSource[],
   input: ResearchPlanningInput,
+  recency?: { now: number },
 ): DiscoveredSource[] {
   const questionTerms = tokenizeForRanking(input.marketQuestion);
   const criteriaTerms = tokenizeForRanking(input.resolutionCriteria);
@@ -361,7 +388,8 @@ function rankSourcesForMarket(
         jurisdictionBonus +
         domainBonus +
         queryIntentBonus -
-        jurisdictionMismatchPenalty;
+        jurisdictionMismatchPenalty +
+        (recency ? recencyBonus(source.publishedAt, recency.now) : 0);
 
       return {
         source,
@@ -429,6 +457,9 @@ export async function runMarketResearch(
   const rankedSources = rankSourcesForMarket(
     discovery.sources,
     input,
+    options.preferRecentSources
+      ? { now: options.now ?? Date.now() }
+      : undefined,
   );
 
   const sourcesToFetch = rankedSources.slice(

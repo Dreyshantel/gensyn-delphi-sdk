@@ -70,3 +70,56 @@ AGENT_MODE=status npx tsx examples/evidence-starter/agent.ts   # refresh verdict
 History is kept in `.delphi-agent/submissions.json` (git-ignored). Do not delete it while submissions are pending: it holds their idempotency keys.
 
 Prize eligibility needs at least 10 judged submissions across 3 or more markets; `AGENT_MODE=status` prints where you stand.
+
+## Control panel (DelphiLens dashboard)
+
+A local React app with six views: **Dashboard** (status, the run's evidence funnel, submissions, prize progress, warnings, activity), **Markets** (questions, probabilities, criteria, the structured market reading, research status), **Research** (queries, providers, fetch results and failures per market), **Evidence** (notes waiting for your Submit or Skip, then every assessed article with its direction, relationship, credibility, dates, scores, reasons and limitations), **Submissions** (statuses, IDs, judge feedback, rewards) and **Settings** (configuration and health; keys are never shown).
+
+```bash
+# Terminal 1, repo root: the local API (reads the same .env as the agent)
+npx tsx examples/evidence-starter/dashboard-server.ts
+
+# Terminal 2: the panel, with live reload
+cd dashboard
+npm install
+npm run dev            # open http://localhost:5173
+```
+
+Or build it once (`npm run build` in `dashboard/`) and open http://localhost:8787, served by the API server itself.
+
+- Searches from the panel are always dry runs; a note is only sent when you click **Submit note** and confirm. Each submit re-runs every eligibility check against Delphi's live limits first.
+- The server listens on 127.0.0.1 only, rejects requests not addressed to localhost, and requires an `X-DelphiLens` header on every action, so other websites can't submit through it.
+- Terms are never accepted from the panel: set `ACCEPT_TERMS` in `.env` after reading them.
+- Candidates wait in `.delphi-agent/review-queue.json`, next to the submission history.
+
+## How evidence is assessed and ranked
+
+**Classification.** The LLM reads one article at a time (the most relevant ~6,000 characters; the quote is still checked against the whole article) and must classify it as `direct_support` (a dated fact that makes YES more likely), `contradiction` (same, for NO), `context`, `inconclusive` or `irrelevant`. A YES/NO direction exists only for the first two. A reply whose relationship and direction disagree is rejected; a direction on context or inconclusive evidence is discarded, never forced.
+
+**Grounding checks** (`fact-extractor.ts`). A directional finding needs a quote found verbatim in the fetched article and an as-of (event) date that is not in the future, not after the article's publication and not after the market cutoff. Passing proves the text is in the source, not that the source is right.
+
+**Event dates come from the article.** A directional finding also needs a `dateQuote`: verbatim article text that states the event date ("on Nov. 18", "released 20 November 2026"), whose month and day must match the as-of date. Relative words ("on Tuesday", "yesterday") count only when the page itself states its publication date. A publication date that came only from a search listing (it can be the date an old page was re-indexed) is never used to date an event, to judge freshness or in the note. This rejects old pages re-listed as new.
+
+**Unrated outlets need a stronger source** (`primary-source.ts`). When the only source for a fact is an unrated outlet, the agent looks for the same fact at a primary or established source: first among the market's fetched articles, then with one targeted search (up to two pages fetched, no LLM call). It must repeat the fact's numbers and most of its key terms. A confirmed fact is submitted with both links and the note names the confirming source; an unconfirmed one is held as "needs primary source".
+
+**Before the LLM** (`evidence-miner.ts`). Syndicated copies of the same report are grouped and only the most credible copy is read (copies are not independent corroboration). Articles are chosen by `0.5 × keyword relevance + 0.25 × publisher credibility + 0.25 × freshness`, never by keywords alone.
+
+**Publisher credibility** (`source-credibility.ts`) is a prior from the domain: primary (governments, regulators, central banks, courts, statistics offices, official league sites) 1.0, established outlets 0.8, unrated 0.5, low-credibility aggregators and user-generated sites 0.2. A finding that rests only on a low-credibility source cannot be submitted.
+
+**Value score** (orders candidates; it is not a gate and not verification):
+
+| Part | Weight | Measures |
+| --- | --- | --- |
+| Impact | 0.30 | the model's confidence that the fact moves the outcome |
+| Credibility | 0.20 | publisher tier |
+| Freshness | 0.20 | age of the fact's event date (≤3 days 1.0 … >30 days 0.2) |
+| Specificity | 0.15 | numbers, dated months and names in the fact |
+| Keyword relevance | 0.15 | rule-based relevance of the article |
+
+**Gates** (`submission-eligibility.ts`): direction established, relationship directional, not low-credibility, confidence ≥ `MIN_CONFIDENCE`, fact ≤ 30 days old, quote present, market open and before the cutoff, ≤ 3 per market, no opposite-side submission on the market, not a repeat of a fact already submitted by the account, within Delphi's limits.
+
+**Feedback loop.** Judge reasons on rejected or unpaid submissions (this market's first) are passed to the LLM on later runs so it avoids repeating them.
+
+**Run records.** Every run writes `.delphi-agent/runs/<time>.json`: markets, the structured market reading, queries, fetch failures, every article's outcome and reasons, and metrics (fetch success, candidate rate, invented quotes caught, duplicate rate, credibility mix, LLM calls and tokens, duration). The control panel's Markets, Research and Evidence views read these.
+
+**Live check.** `npx tsx examples/evidence-starter/live-check.ts` runs this whole pipeline in dry-run on four representative markets with a throwaway history, prints the evaluation and saves a run record.

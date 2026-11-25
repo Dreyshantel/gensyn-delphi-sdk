@@ -56,6 +56,11 @@ describe("checkEligibility", () => {
     expect(checkEligibility(candidate, context)).toEqual({ eligible: true, reasons: [] });
   });
 
+  it("blocks a fact too old to be new to the forecaster", () => {
+    expect(reasonsFor({ asOfDate: "2026-09-01" })[0]).toContain("85 days old (limit 30)");
+    expect(reasonsFor({ asOfDate: "2026-09-01" }, { maxFactAgeDays: 120 })).toEqual([]);
+  });
+
   it("blocks a candidate without a direction", () => {
     expect(reasonsFor({ direction: undefined })).toContain("No YES/NO direction has been established");
   });

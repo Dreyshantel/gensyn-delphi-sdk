@@ -30,7 +30,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "typecheck:examples": "tsc -p examples/evidence-starter/tsconfig.json"
   },
   "keywords": [
     "delphi",

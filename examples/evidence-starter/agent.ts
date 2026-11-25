@@ -31,7 +31,12 @@ import type {
 import { createInterface } from "node:readline/promises";
 
 import { createLlmClientFromEnv, type LlmClient } from "./llm-client.js";
-import { mineCandidates, type MiningResult } from "./evidence-miner.js";
+import { judgeFeedbackFrom, mineCandidates, type MiningResult } from "./evidence-miner.js";
+import { createCorroborator } from "./primary-source.js";
+import { fetchArticle } from "./article-fetcher.js";
+import type { MarketSpec } from "./fact-extractor.js";
+import type { MarketResearchPipelineResult } from "./market-research-pipeline.js";
+import { buildRunRecord, DEFAULT_RUNS_DIR, saveRunRecord, type RunRecord } from "./run-record.js";
 import { SubmissionHistory, DEFAULT_HISTORY_PATH } from "./submission-history.js";
 import {
   refreshVerdicts,
@@ -661,6 +666,11 @@ export function buildSearchProvider(
   };
 }
 
+/** Names of the search providers buildSearchProvider() uses with this environment. */
+export function searchProviderNames(env: NodeJS.ProcessEnv = process.env): string[] {
+  return env.TAVILY_API_KEY?.trim() ? ["Google News", "Tavily"] : ["Google News"];
+}
+
 export interface MineModeOptions {
   siteUrl: string;
   mode: SubmissionMode;
@@ -678,54 +688,117 @@ export interface MineModeOptions {
   /** Default 5. */
   maxSubmissionsPerRun?: number;
   minConfidence?: number;
-  /** Ask the LLM for search queries (one call per market). Default true when an LLM is set. */
+  /** Ask the LLM for search queries and a market spec (one call per market). Default true when an LLM is set. */
   useLlmQueryPlanner?: boolean;
   researchOptions?: ResearchRunnerOptions;
+  /** Names of the search providers in use, for the run record. */
+  searchProviders?: string[];
+  /** Confirm facts from unrated outlets at a primary or established source (one search each). Default true. */
+  corroborateUnratedSources?: boolean;
+  /** Read each directional finding twice and keep it only if both readings agree. Default true. */
+  confirmDirectional?: boolean;
+  /** Save the run record to this folder (e.g. DEFAULT_RUNS_DIR). Not saved when omitted. */
+  runsDir?: string;
+  /** "live-check" runs use sample markets; recorded as such. */
+  kind?: RunRecord["kind"];
   fetch?: typeof fetch;
   log?: (...args: unknown[]) => void;
   now?: number;
 }
 
 /**
- * Full competition loop: discover → research → extract → check → submit.
+ * Full competition loop: discover → research → assess → check → submit.
  *
- * Safe by default: in "dry-run" nothing is sent.
+ * Safe by default: in "dry-run" nothing is sent. Every run produces a
+ * RunRecord (markets, research, every finding, metrics and warnings).
  */
 export async function runMineMode(opts: MineModeOptions): Promise<{
   mining: MiningResult | null;
   summary: SubmissionRunSummary | null;
+  record: RunRecord;
 }> {
   const log = opts.log ?? console.log;
   const now = opts.now ?? Date.now();
+  const startedAt = Date.now();
   const maxPerMarket = 3;
+  const warnings: string[] = [];
+  const warn = (message: string) => {
+    warnings.push(message);
+    log(message);
+  };
 
   const markets = await discoverMarkets({
     siteUrl: opts.siteUrl,
     fetch: opts.fetch,
     skipInvalidMarkets: true,
-    onInvalidMarket: (message) => log(message),
+    onInvalidMarket: warn,
   });
   const open = getOpenMarkets(markets, now);
+  const supplied = opts.resolutionCriteriaByMarket ?? {};
+  const suppliedKeys = new Set(Object.keys(supplied).map((k) => k.toLowerCase()));
 
   const criteriaByMarket = buildCriteriaMap(
     open,
-    opts.resolutionCriteriaByMarket ?? {},
+    supplied,
     (address) => opts.history.forMarket(address).length >= maxPerMarket,
   );
 
   log(`Markets discovered: ${markets.length}, open: ${open.length}, with slots left: ${criteriaByMarket.size}`);
 
+  const specs = new Map<string, MarketSpec>();
+  let research: MarketResearchPipelineResult | null = null;
+  let mining: MiningResult | null = null;
+  let summary: SubmissionRunSummary | null = null;
+
+  const finish = () => {
+    const llm = opts.llm;
+
+    for (const [address, spec] of specs) {
+      if (spec.clarity === "ambiguous") {
+        warnings.push(`Ambiguous resolution criteria for ${address}: ${spec.notes || "see the market spec"}`);
+      }
+    }
+
+    if (llm?.usage && llm.usage.rateLimitWaits > 0) {
+      warnings.push(`The LLM hit rate limits ${llm.usage.rateLimitWaits} time(s); the run waited and retried`);
+    }
+
+    const record = buildRunRecord({
+      kind: opts.kind ?? "mine",
+      mode: opts.mode,
+      startedAt,
+      finishedAt: Date.now(),
+      markets,
+      openMarkets: open,
+      criteriaByMarket,
+      suppliedCriteria: suppliedKeys,
+      specs,
+      research,
+      mining,
+      submissions: summary,
+      llm: llm ? { model: llm.model, callsMade: llm.callsMade, usage: llm.usage } : null,
+      searchProviders: opts.searchProviders ?? ["custom"],
+      warnings,
+    });
+
+    if (opts.runsDir) {
+      log(`Run record saved to ${saveRunRecord(record, opts.runsDir)}`);
+    }
+
+    return { mining, summary, record };
+  };
+
   if (criteriaByMarket.size === 0) {
     log("Nothing to research.");
-    return { mining: null, summary: null };
+    return finish();
   }
 
   const queryGenerator =
     opts.llm && opts.useLlmQueryPlanner !== false
-      ? createLlmQueryGenerator(opts.llm, focusedQueryGenerator, log)
+      ? createLlmQueryGenerator(opts.llm, focusedQueryGenerator, (...args) => warn(args.map(String).join(" ")), specs)
       : focusedQueryGenerator;
 
-  const research = await runMarketResearchPipeline({
+  research = await runMarketResearchPipeline({
     siteUrl: opts.siteUrl,
     fetch: opts.fetch,
     skipInvalidMarkets: true,
@@ -735,6 +808,7 @@ export async function runMineMode(opts: MineModeOptions): Promise<{
     researchOptions: {
       maxArticlesToFetch: 8,
       queryGenerator,
+      preferRecentSources: true,
       ...opts.researchOptions,
       assessmentModel:
         opts.researchOptions?.assessmentModel ?? ruleBasedEvidenceAssessor,
@@ -752,22 +826,34 @@ export async function runMineMode(opts: MineModeOptions): Promise<{
   }
 
   for (const failure of research.researchFailures) {
-    log(`Research failed for ${failure.marketAddress}: ${failure.reason}`);
+    warn(`Research failed for ${failure.marketAddress}: ${failure.reason}`);
   }
 
   if (!opts.llm) {
-    log(
-      "\nNo LLM configured (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL), so no YES/NO " +
-        "direction can be established and nothing is submitted. Run RESEARCH_MODE=1 " +
-        "for the detailed research report.",
+    warn(
+      "No LLM configured (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL): research ran, but no evidence " +
+        "was assessed and nothing can be submitted.",
     );
-    return { mining: null, summary: null };
+    return finish();
   }
 
-  const mining = await mineCandidates({
+  const history = opts.history.all();
+
+  mining = await mineCandidates({
     research,
     llm: opts.llm,
     criteriaByMarket,
+    specs,
+    judgeFeedbackFor: (address) => judgeFeedbackFrom(history, address),
+    confirmDirectional: opts.confirmDirectional !== false,
+    corroborate:
+      opts.corroborateUnratedSources === false
+        ? undefined
+        : createCorroborator({
+            searchProvider: opts.researchOptions?.searchProvider ?? buildSearchProvider(),
+            articleFetcher: opts.researchOptions?.articleFetcher ?? fetchArticle,
+            log,
+          }),
     maxArticlesPerMarket: opts.maxArticlesPerMarket,
     skipArticle: (marketAddress, url) =>
       opts.history.forMarket(marketAddress).some((record) => record.sourceUrl === url),
@@ -775,16 +861,21 @@ export async function runMineMode(opts: MineModeOptions): Promise<{
     log,
   });
 
+  if (mining.budgetExhausted) {
+    warnings.push("The LLM call budget ran out; some articles were not assessed (raise LLM_MAX_CALLS)");
+  }
+
   log(
-    `\nArticles sent to the LLM: ${mining.articlesSentToLlm} ` +
-      `(LLM calls this run: ${opts.llm.callsMade}), candidates: ${mining.candidates.length}`,
+    `\nArticles assessed by the LLM: ${mining.articlesSentToLlm} ` +
+      `(LLM calls this run: ${opts.llm.callsMade}${opts.llm.usage ? `, tokens ${opts.llm.usage.totalTokens}` : ""}), ` +
+      `candidates: ${mining.candidates.length}`,
   );
 
   for (const failure of mining.failures) {
-    log(`  no candidate from ${failure.url}: ${failure.reason}`);
+    log(`  not a candidate: ${failure.url}: ${failure.reason}`);
   }
 
-  const summary = await runSubmissions({
+  summary = await runSubmissions({
     candidates: mining.candidates,
     history: opts.history,
     mode: opts.mode,
@@ -815,7 +906,7 @@ export async function runMineMode(opts: MineModeOptions): Promise<{
     log(`Stopped early: ${summary.stoppedReason}`);
   }
 
-  return { mining, summary };
+  return finish();
 }
 
 /** Refreshes verdicts and prints the agent's submission record. */
@@ -1024,6 +1115,8 @@ if (
           minConfidence,
           useLlmQueryPlanner: process.env.LLM_QUERY_PLANNER?.trim() !== "0",
           researchOptions: { searchProvider: buildSearchProvider() },
+          searchProviders: searchProviderNames(),
+          runsDir: DEFAULT_RUNS_DIR,
         });
       } finally {
         readline?.close();

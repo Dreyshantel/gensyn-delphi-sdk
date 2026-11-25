@@ -36,6 +36,7 @@ const goodReply = {
   asOfDate: "2026-11-20",
   direction: "no",
   quote: '"the committee sees no case for a cut this year,"',
+  dateQuote: "released on 20 November 2026",
   rationale: "A stated no-cut stance directly lowers the chance of a December cut.",
   confidence: 0.8,
 };
@@ -95,14 +96,15 @@ describe("validateExtraction", () => {
   });
 
   it("passes through the model's reason when there is no fact", () => {
-    expect(validateExtraction({ hasFact: false, reason: "only background" }, input, now)).toEqual({
+    expect(validateExtraction({ hasFact: false, reason: "only background" }, input, now)).toMatchObject({
       ok: false,
       reason: "No usable fact: only background",
+      relationship: "inconclusive",
     });
   });
 
   it.each([
-    ["an invalid direction", { direction: "neutral" }, "Direction must be yes or no"],
+    ["an invalid direction", { direction: "neutral" }, "Relationship missing"],
     ["a missing date", { asOfDate: "November" }, "asOfDate must be YYYY-MM-DD"],
     ["a future date", { asOfDate: "2026-11-30" }, "asOfDate is in the future"],
     ["a date after publication", { asOfDate: "2026-11-24" }, "after the article was published"],

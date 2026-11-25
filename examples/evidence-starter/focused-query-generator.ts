@@ -23,6 +23,7 @@ import type {
 } from "./research-planner.js";
 import type { EvidenceSourceType } from "./evidence-research.js";
 import type { LlmClient } from "./llm-client.js";
+import type { MarketSpec } from "./fact-extractor.js";
 
 const QUESTION_STOP_WORDS = new Set([
   "will", "would", "does", "do", "did", "is", "are", "was", "were", "be",
@@ -235,10 +236,37 @@ export const focusedQueryGenerator: ResearchQueryGenerator = async (
 
 const VALID_TYPES: EvidenceSourceType[] = ["official", "regulatory", "academic", "news", "other"];
 
-const PLANNER_PROMPT = `You plan web searches for evidence on a Yes/No prediction market.
-Return 4 to 6 short search-engine queries (2 to 8 words each, keywords not sentences) that are most likely to find NEW, specific, dated facts that would change the probability: scheduled events, official decisions, filings, data releases, injuries or line-ups, polls, on-chain or price data, local or niche coverage.
+const PLANNER_PROMPT = `You prepare research for a Yes/No prediction market.
+
+1. Read the resolution criteria and state precisely what decides the market:
+   the subject (entity), the event, the measurable outcome (threshold, number, result), the deadline, and the geography.
+   Mark "clarity" as "ambiguous" if the criteria leave real room for interpretation (subjective words, unclear source, unclear date).
+2. Return 4 to 6 short search-engine queries (2 to 8 words, keywords not sentences) most likely to find NEW, specific, dated facts that change the probability: official decisions and publications, statistics releases, filings, court rulings, scheduled events, injuries or line-ups, polls, on-chain or price data, local or niche coverage. At least one query should target the primary or official source.
 Do not repeat the question as a sentence. Do not invent facts.
-Reply with JSON only: {"queries": [{"query": "...", "objective": "...", "sourceTypes": ["news" | "official" | "regulatory" | "academic" | "other"]}]}`;
+
+Reply with JSON only:
+{"spec": {"subject": "...", "event": "...", "measurableOutcome": "...", "deadline": "...", "geography": "...", "clarity": "clear" | "ambiguous", "notes": "..."},
+ "queries": [{"query": "...", "objective": "...", "sourceTypes": ["news" | "official" | "regulatory" | "academic" | "other"]}]}`;
+
+function readSpec(value: unknown): MarketSpec | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+
+  const raw = value as Record<string, unknown>;
+  const text = (key: string) => (typeof raw[key] === "string" ? (raw[key] as string).trim().slice(0, 200) : "");
+  const spec: MarketSpec = {
+    subject: text("subject"),
+    event: text("event"),
+    measurableOutcome: text("measurableOutcome"),
+    deadline: text("deadline"),
+    geography: text("geography"),
+    clarity: raw.clarity === "ambiguous" ? "ambiguous" : "clear",
+    notes: text("notes"),
+  };
+
+  return spec.subject && spec.event ? spec : undefined;
+}
 
 /**
  * LLM query planning with a rule-based fallback.
@@ -251,6 +279,8 @@ export function createLlmQueryGenerator(
   llm: LlmClient,
   fallback: ResearchQueryGenerator = focusedQueryGenerator,
   log: (...args: unknown[]) => void = () => {},
+  /** Receives each market's structured spec, keyed by lower-cased address. */
+  specs?: Map<string, MarketSpec>,
 ): ResearchQueryGenerator {
   return async (input) => {
     const base = (await fallback(input)) as { queries: ResearchQuery[] };
@@ -268,7 +298,13 @@ export function createLlmQueryGenerator(
             `SUBMISSION DEADLINE: ${input.evidenceCutoffAt}\n` +
             `DATA SOURCES: ${input.suggestedDataSources.join(", ") || "none listed"}`,
         },
-      ])) as { queries?: unknown };
+      ])) as { queries?: unknown; spec?: unknown };
+
+      const spec = readSpec(reply.spec);
+
+      if (spec && specs) {
+        specs.set(input.marketAddress.toLowerCase(), spec);
+      }
 
       if (Array.isArray(reply.queries)) {
         suggested = reply.queries

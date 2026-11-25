@@ -89,6 +89,10 @@ export function composeNote(candidate: SubmissionCandidate): string {
     `Source: ${candidate.publisher}${published}: "${candidate.quote}"`,
   ];
 
+  if (candidate.corroboratedBy) {
+    lines.push(`Also reported by ${candidate.corroboratedBy.publisher} (link 2).`);
+  }
+
   if (candidate.rationale) {
     lines.push(`Relevance: ${candidate.rationale}`);
   }
@@ -117,7 +121,8 @@ function preview(candidate: SubmissionCandidate, note: string): string {
 export function orderCandidates(
   candidates: SubmissionCandidate[],
 ): SubmissionCandidate[] {
-  const byConfidence = [...candidates].sort((a, b) => b.confidence - a.confidence);
+  const strength = (c: SubmissionCandidate) => c.valueScore ?? c.confidence;
+  const byConfidence = [...candidates].sort((a, b) => strength(b) - strength(a));
   const rankInMarket = new Map<SubmissionCandidate, number>();
   const seen = new Map<string, number>();
 
@@ -131,7 +136,7 @@ export function orderCandidates(
 
   return byConfidence.sort(
     (a, b) =>
-      rankInMarket.get(a)! - rankInMarket.get(b)! || b.confidence - a.confidence,
+      rankInMarket.get(a)! - rankInMarket.get(b)! || strength(b) - strength(a),
   );
 }
 
@@ -439,7 +444,7 @@ export async function runSubmissions(
       sourceUrl: candidate.sourceUrl,
       publisher: candidate.publisher,
       note,
-      links: [candidate.sourceUrl],
+      links: [candidate.sourceUrl, ...(candidate.supportingLinks ?? [])].slice(0, 5),
     };
 
     if (mode === "dry-run") {

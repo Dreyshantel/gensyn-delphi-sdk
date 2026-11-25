@@ -137,3 +137,6 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Evidence agent local state (submission history, idempotency keys)
+.delphi-agent/

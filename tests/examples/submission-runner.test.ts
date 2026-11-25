@@ -397,3 +397,26 @@ describe("orderCandidates", () => {
     expect(orderCandidates([a2, c1, a1, b1])).toEqual([a1, b1, c1, a2]);
   });
 });
+
+describe("corroborated notes", () => {
+  it("names the confirming source in the note and sends its link second", async () => {
+    const api = fakeApi();
+    const history = SubmissionHistory.inMemory();
+    const confirmed = {
+      ...candidate,
+      publisher: "Around Prague",
+      credibility: "unknown" as const,
+      corroboratedBy: { publisher: "Federal Reserve", credibility: "primary" as const },
+      supportingLinks: ["https://www.federalreserve.gov/monetarypolicy/fomcminutes20261028.htm"],
+    };
+
+    expect(composeNote(confirmed)).toContain("Also reported by Federal Reserve (link 2).");
+
+    await runSubmissions({ candidates: [confirmed], history, mode: "auto", client: api.client, log: quiet, now });
+
+    expect(history.all()[0].links).toEqual([
+      candidate.sourceUrl,
+      "https://www.federalreserve.gov/monetarypolicy/fomcminutes20261028.htm",
+    ]);
+  });
+});

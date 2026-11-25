@@ -23,6 +23,15 @@ export interface LlmConfig {
   maxCallsPerRun?: number;
   /** Per-request timeout. Default 60 s. */
   timeoutMs?: number;
+  /**
+   * Token budget per rolling minute. Default 7000 (Groq's free tier allows
+   * 8000 TPM on openai/gpt-oss-120b). Calls wait until the estimate fits.
+   */
+  tokensPerMinute?: number;
+  /** Cap on output tokens, reasoning included. Default 2048. */
+  maxCompletionTokens?: number;
+  /** For reasoning models such as gpt-oss on Groq: "low" | "medium" | "high". */
+  reasoningEffort?: string;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -33,12 +42,26 @@ export interface LlmMessage {
   content: string;
 }
 
+export interface LlmUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  rateLimitWaits: number;
+}
+
 export interface LlmClient {
   /** Sends the messages and returns the parsed JSON object the model replied with. */
   completeJson(messages: LlmMessage[]): Promise<unknown>;
   /** Calls made so far in this run. */
   readonly callsMade: number;
   readonly model: string;
+  /** Token usage reported by the provider (optional for test doubles). */
+  readonly usage?: LlmUsage;
+}
+
+/** Rough token estimate: about 4 characters per token for English text. */
+export function estimateTokens(messages: LlmMessage[]): number {
+  return Math.ceil(messages.reduce((sum, m) => sum + m.content.length, 0) / 4);
 }
 
 export class LlmBudgetExceededError extends Error {
@@ -105,8 +128,31 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = config.now ?? Date.now;
 
+  const tokensPerMinute = config.tokensPerMinute ?? 7000;
+  const maxCompletionTokens = config.maxCompletionTokens ?? 2048;
+
   let callsMade = 0;
   let lastCallAt = 0;
+  const usage: LlmUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, rateLimitWaits: 0 };
+  /** Tokens spent in the last minute, for per-minute token limits. */
+  let window: { at: number; tokens: number }[] = [];
+
+  async function waitForTokenBudget(estimate: number): Promise<void> {
+    // A single call larger than the whole budget still goes out, alone.
+    const needed = Math.min(estimate, tokensPerMinute);
+
+    for (;;) {
+      const cutoff = now() - 60_000;
+      window = window.filter((entry) => entry.at > cutoff);
+      const used = window.reduce((sum, entry) => sum + entry.tokens, 0);
+
+      if (used + needed <= tokensPerMinute || window.length === 0) {
+        return;
+      }
+
+      await sleep(Math.max(250, window[0].at + 60_000 - now()));
+    }
+  }
 
   async function send(messages: LlmMessage[]): Promise<Response> {
     const wait = lastCallAt + minIntervalMs - now();
@@ -115,7 +161,12 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       await sleep(wait);
     }
 
+    // Reserve the prompt plus a typical answer (reasoning models think first).
+    const estimate = estimateTokens(messages) + Math.min(1200, maxCompletionTokens);
+    await waitForTokenBudget(estimate);
+
     lastCallAt = now();
+    window.push({ at: lastCallAt, tokens: estimate });
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -132,6 +183,8 @@ export function createLlmClient(config: LlmConfig): LlmClient {
           model: config.model,
           messages,
           temperature: 0,
+          max_completion_tokens: maxCompletionTokens,
+          ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
         }),
       });
     } finally {
@@ -146,9 +199,16 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
     model: config.model,
 
+    get usage() {
+      return { ...usage };
+    },
+
     async completeJson(messages) {
-      // A retry counts against the budget too: providers count failed calls.
-      for (let attempt = 0; attempt < 2; attempt++) {
+      // Up to 3 retries on rate limits or server errors. Retries count
+      // against the run budget too: providers count failed calls.
+      const maxAttempts = 4;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (callsMade >= maxCallsPerRun) {
           throw new LlmBudgetExceededError(maxCallsPerRun);
         }
@@ -158,15 +218,16 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         const response = await send(messages);
 
         if (
-          attempt === 0 &&
+          attempt < maxAttempts - 1 &&
           (response.status === 429 || response.status >= 500)
         ) {
           const retryAfter = Number(response.headers.get("retry-after"));
 
+          usage.rateLimitWaits++;
           await sleep(
             Number.isFinite(retryAfter) && retryAfter > 0
-              ? Math.min(retryAfter, 60) * 1000
-              : 10_000,
+              ? Math.min(retryAfter, 90) * 1000
+              : 15_000 * (attempt + 1),
           );
 
           continue;
@@ -188,6 +249,25 @@ export function createLlmClient(config: LlmConfig): LlmClient {
           throw new Error("LLM response was not valid JSON");
         }
 
+        const reported = (body as { usage?: Record<string, unknown> }).usage;
+
+        if (reported) {
+          const prompt = Number(reported.prompt_tokens) || 0;
+          const completion = Number(reported.completion_tokens) || 0;
+          const total = Number(reported.total_tokens) || prompt + completion;
+
+          usage.promptTokens += prompt;
+          usage.completionTokens += completion;
+          usage.totalTokens += total;
+
+          // Replace this call's estimate with what the provider counted.
+          const entry = window[window.length - 1];
+
+          if (entry && total > 0) {
+            entry.tokens = total;
+          }
+        }
+
         const content = (
           body as { choices?: { message?: { content?: unknown } }[] }
         ).choices?.[0]?.message?.content;
@@ -199,7 +279,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         return parseJsonReply(content);
       }
 
-      throw new Error("LLM request failed after a retry");
+      throw new Error("LLM request still rate-limited after 3 retries");
     },
   };
 }
@@ -221,8 +301,16 @@ export function createLlmClientFromEnv(
   }
 
   if (!baseUrl || !apiKey || !model) {
+    const missing = [
+      ["LLM_BASE_URL", baseUrl],
+      ["LLM_API_KEY", apiKey],
+      ["LLM_MODEL", model],
+    ]
+      .filter(([, value]) => !value)
+      .map(([name]) => name);
+
     throw new Error(
-      "Set all of LLM_BASE_URL, LLM_API_KEY and LLM_MODEL, or none of them",
+      `Set all of LLM_BASE_URL, LLM_API_KEY and LLM_MODEL, or none of them. Missing: ${missing.join(", ")}`,
     );
   }
 
@@ -248,5 +336,8 @@ export function createLlmClientFromEnv(
     model,
     minIntervalMs: optionalInt("LLM_MIN_INTERVAL_MS"),
     maxCallsPerRun: optionalInt("LLM_MAX_CALLS"),
+    tokensPerMinute: optionalInt("LLM_TOKENS_PER_MINUTE"),
+    maxCompletionTokens: optionalInt("LLM_MAX_COMPLETION_TOKENS"),
+    reasoningEffort: env.LLM_REASONING_EFFORT?.trim() || undefined,
   });
 }
